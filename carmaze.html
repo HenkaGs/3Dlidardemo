@@ -1,0 +1,187 @@
+<!DOCTYPE html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>CarMaze</title>
+<style>
+:root{--bg:#12161d;--fg:#e8eaf0;--mut:#8f98aa;--btn:#222a3a;--line:#3a445c;color-scheme:dark;box-sizing:border-box;padding-top:env(safe-area-inset-top,0px);padding-bottom:env(safe-area-inset-bottom,0px)}
+html{scroll-padding-top:env(safe-area-inset-top,0px)}
+body{margin:0;background:var(--bg);color:var(--fg);font:14px/1.5 system-ui,-apple-system,"Segoe UI",sans-serif;padding:12px}
+.w{max-width:900px;margin:0 auto}
+.bar{display:flex;flex-wrap:wrap;gap:8px 14px;align-items:center}
+h1{font-size:18px;margin:0 8px 0 0}
+button{background:var(--btn);color:var(--fg);border:1px solid var(--line);border-radius:6px;padding:6px 12px;cursor:pointer;font:inherit}
+button:focus-visible,input:focus-visible{outline:2px solid #60a5fa;outline-offset:2px}
+canvas{width:100%;display:block;margin:10px 0;background:#0b0e14;border-radius:8px}
+.st{color:var(--mut)}.st b{color:var(--fg)}
+</style></head><body><div class="w">
+<div class="bar"><h1>CarMaze</h1>
+<button id="pp">Pause</button><button id="nm">New maze</button><button id="rs">Reset learning</button><button id="tb">Test best on 20 new mazes</button>
+<label>Speed <input id="sp" type="range" min="1" max="25" value="5"></label>
+<label><input id="rg" type="checkbox" checked> New maze every generation</label></div>
+<canvas id="c"></canvas>
+<div class="st" id="st"></div>
+<p class="st">Each car is a small neural network (23 inputs, 12 hidden, 2 outputs: steering and throttle). It sees only 9 distance rays across a 180° view (forward, or backward while reversing), 9 matching finish-in-sight signals, its own speed and steering angle, and 3 numbers about the nearest junction sign it can see in its field of view (how close it is and which way its arrow points relative to the car). Every junction has a yellow arrow sign pointing along the shortest way to the finish. After each generation the best cars are bred with mutation. The path distance to the finish is used only to score a car after it drives; the car never sees the map. Crashing costs a large score penalty, stalling a smaller one, and reversing or flipping between forward and reverse also costs score. Seeing the finish zone earns a bonus that grows as the car gets closer. Red cars crashed, orange ones stalled; the leader's rays turn pink when reversing and green when they see the finish.</p>
+</div>
+<script>
+const $=id=>document.getElementById(id),C=$('c'),X=C.getContext('2d');
+const CW=10,CH=7,GW=2*CW+1,GH=2*CH+1,S=36,N=50,R=120,SR=90,VM=2,VR=1.2,L=12,MAXT=3000,CRASH=6,STALL=6,RP=.6,FLIP=.25,D=[[1,0],[-1,0],[0,1],[0,-1]];
+C.width=GW*S;C.height=GH*S;
+const NI=23,H=12,NO=2,NT=NI,GL=NT*H+H+H*NO+NO;
+let grid,dist,signs=[],start,D0,cars=[],gen=0,bestFit=-1e9,bestG=null,wins=0,lastWin=0,lastC=0,lastS=0,testRes='',paused=false;
+const gauss=()=>Math.sqrt(-2*Math.log(Math.random()+1e-9))*Math.cos(6.2832*Math.random());
+const rgen=()=>Array.from({length:GL},()=>gauss()*.7);
+function makeMaze(){
+  grid=Array.from({length:GH},()=>Array(GW).fill(1));
+  const st=[[1,1]];grid[1][1]=0;
+  while(st.length){
+    const [x,y]=st[st.length-1];
+    const n=D.map(([dx,dy])=>[dx*2,dy*2]).filter(([dx,dy])=>{const a=x+dx,b=y+dy;return a>0&&b>0&&a<GW-1&&b<GH-1&&grid[b][a]});
+    if(!n.length){st.pop();continue}
+    const [dx,dy]=n[Math.random()*n.length|0];
+    grid[y+dy/2][x+dx/2]=0;grid[y+dy][x+dx]=0;st.push([x+dx,y+dy]);
+  }
+  for(let i=0;i<10;i++){const x=1+(Math.random()*(GW-2)|0),y=1+(Math.random()*(GH-2)|0);if(grid[y][x]&&x%2!==y%2)grid[y][x]=0;}
+  start={x:1.5*S,y:1.5*S,a:grid[1][2]?Math.PI/2:0};
+  dist=grid.map(r=>r.map(()=>-1));
+  const q=[[GW-2,GH-2]];dist[GH-2][GW-2]=0;
+  for(let k=0;k<q.length;k++){const [x,y]=q[k];for(const [dx,dy] of D){const a=x+dx,b=y+dy;if(!grid[b][a]&&dist[b][a]<0){dist[b][a]=dist[y][x]+1;q.push([a,b]);}}}
+  D0=dist[1][1];
+  signs=[];
+  for(let j=1;j<GH-1;j++)for(let i=1;i<GW-1;i++){
+    const d=dist[j][i];if(d<=0)continue;
+    let n=0,dir=null;
+    for(const [dx,dy] of D)if(!grid[j+dy][i+dx]){n++;if(!dir&&dist[j+dy][i+dx]===d-1)dir=[dx,dy];}
+    if(n>=3&&dir)signs.push({x:(i+.5)*S,y:(j+.5)*S,a:Math.atan2(dir[1],dir[0])});
+  }
+}
+const wall=(x,y)=>{const r=grid[y/S|0];return !r||r[x/S|0]!==0};
+function prog(x,y){
+  const i=x/S|0,j=y/S|0,d=dist[j][i];if(d<=0)return 0;
+  for(const [dx,dy] of D){
+    if(dist[j+dy]&&dist[j+dy][i+dx]===d-1){
+      const f=((x-(i+.5)*S)*dx+(y-(j+.5)*S)*dy)/S+.5;
+      return d-Math.max(0,Math.min(1,f));
+    }
+  }
+  return d;
+}
+function fwd(w,inp){
+  const h=[],b=NT*H+H,o=[];
+  for(let j=0;j<H;j++){let s=w[NT*H+j];for(let i=0;i<NT;i++)s+=inp[i]*w[j*NT+i];h[j]=Math.tanh(s);}
+  for(let k=0;k<NO;k++){let s=w[b+H*NO+k];for(let j=0;j<H;j++)s+=h[j]*w[b+k*H+j];o[k]=Math.tanh(s);}
+  return [o,h];
+}
+class Car{
+  constructor(g){this.g=g;this.x=start.x;this.y=start.y;this.a=start.a;this.v=0;this.s=0;this.dead=0;this.t=0;this.mp=D0;this.lt=0;this.won=0;this.rays=Array(9).fill(1);this.gr=Array(9).fill(0);this.rev=0;this.rd=0;this.fl=0;this.ls=0;this.cx=this.x;this.cy=this.y;this.sd=1e9;}
+  signIn(){
+    let best=null,bd=SR;const da=this.rev?this.a+Math.PI:this.a;
+    for(const g of signs){
+      const dx=g.x-this.x,dy=g.y-this.y,d=Math.hypot(dx,dy);
+      if(d>=bd||(d>14&&Math.cos(Math.atan2(dy,dx)-da)<0))continue;
+      let ok=1;for(let t=6;t<d;t+=6)if(wall(this.x+dx*t/d,this.y+dy*t/d)){ok=0;break;}
+      if(ok){best=g;bd=d;}
+    }
+    if(!best)return [0,0,0];
+    const v=1-bd/SR,r=best.a-this.a;return [v,v*Math.cos(r),v*Math.sin(r)];
+  }
+  rayAng(i){return this.rev?this.a-Math.PI/2-i*Math.PI/8:this.a-Math.PI/2+i*Math.PI/8;}
+  sense(){
+    this.rev=this.v<-.02?1:(this.v>.02?0:this.rev);
+    for(let i=0;i<9;i++){
+      const g=this.rayAng(i),cx=Math.cos(g),cy=Math.sin(g);let d=0,gd=-1;
+      while(d<R&&!wall(this.x+cx*d,this.y+cy*d)){
+        if(gd<0&&((this.x+cx*d)/S|0)===GW-2&&((this.y+cy*d)/S|0)===GH-2)gd=d;
+        d+=3;
+      }
+      this.rays[i]=Math.min(d,R)/R;this.gr[i]=gd<0?0:1-gd/R;
+      if(gd>=0)this.sd=Math.min(this.sd,Math.hypot(this.x-(GW-1.5)*S,this.y-(GH-1.5)*S));
+    }
+  }
+  step(){
+    if(this.dead)return;
+    this.sense();
+    const [o]=fwd(this.g,[...this.rays,...this.gr,this.v/VM,this.s/.75,...this.signIn()]);
+    this.s+=Math.max(-.08,Math.min(.08,o[0]*.75-this.s));
+    let v=this.v+o[1]*.12;v-=Math.sign(v)*Math.min(Math.abs(v),.015);
+    this.v=Math.max(-VR,Math.min(VM,v));
+    this.a+=this.v/L*Math.tan(this.s);
+    this.x+=Math.cos(this.a)*this.v;this.y+=Math.sin(this.a)*this.v;this.t++;
+    if(this.v<0)this.rd-=this.v;
+    const sg=Math.sign(this.v);if(sg&&sg!==this.ls){if(this.ls)this.fl++;this.ls=sg;}
+    const c=Math.cos(this.a),s=Math.sin(this.a);
+    const inG=(px,py)=>(px/S|0)===GW-2&&(py/S|0)===GH-2;
+    if(inG(this.x,this.y)||inG(this.x+c*8-s*4.5,this.y+s*8+c*4.5)||inG(this.x+c*8+s*4.5,this.y+s*8-c*4.5)){this.won=1;this.dead=3;return;}
+    for(const [u,w] of [[8,4.5],[8,-4.5],[-8,4.5],[-8,-4.5]])
+      if(wall(this.x+c*u-s*w,this.y+s*u+c*w)){this.dead=1;return;}
+    const p=prog(this.x,this.y);
+    if(p<this.mp-1e-6){this.mp=p;this.lt=this.t;}
+    if(dist[this.y/S|0][this.x/S|0]===0){this.won=1;this.dead=3;}
+    else if(this.t-this.lt>240||this.t>MAXT)this.dead=2;
+    else if(this.t%60===0){if(Math.hypot(this.x-this.cx,this.y-this.cy)<18)this.dead=2;this.cx=this.x;this.cy=this.y;}
+  }
+  fit(){return D0-this.mp+(this.won?20+(MAXT-this.t)/60:0)-(this.dead===1?CRASH:this.dead===2?STALL:0)+(this.sd<1e9?1+3*(1-Math.min(1,this.sd/R)):0)-this.rd/S*RP-this.fl*FLIP;}
+}
+const cl=g=>{const x=g.slice();x.n=g.n;x.avg=g.avg;return x;};
+function evolve(){
+  const rg=$('rg').checked;
+  for(const c of cars){const n=Math.min(c.g.n||0,6),f=c.fit();c.sc=rg?((c.g.avg||0)*n+f)/(n+1):f;c.g.n=n+1;c.g.avg=c.sc;}
+  cars.sort((a,b)=>b.sc-a.sc);
+  const top=cars[0],w=cars.filter(c=>c.won).length;lastWin=w;wins+=w;lastC=cars.filter(c=>c.dead===1).length;lastS=cars.filter(c=>c.dead===2).length;
+  if(rg||top.sc>=bestFit){bestFit=top.sc;bestG=top.g;}
+  const par=cars.slice(0,10).map(c=>c.g),ng=[bestG,par[0],par[1],par[2]].map(cl);
+  while(ng.length<N){
+    if(Math.random()<.04){ng.push(rgen());continue;}
+    const a=par[Math.random()*par.length|0],b=par[Math.random()*par.length|0],m=.04+Math.random()*.16,sg=.08+Math.random()*.3;
+    ng.push(a.map((v,i)=>{let x=Math.random()<.7?v:b[i];if(Math.random()<m)x+=gauss()*sg;return x;}));
+  }
+  gen++;
+  if(rg){if(gen%10===0)testBest();makeMaze();}
+  cars=ng.map(g=>new Car(g));
+}
+function testBest(){
+  const g=bestG||cars[0].g,T=20;let ok=0;
+  for(let k=0;k<T;k++){makeMaze();const c=new Car(g);let n=0;while(!c.dead&&n++<MAXT)c.step();ok+=c.won;}
+  testRes=ok+'/'+T;
+}
+function drawCar(c,col){
+  X.save();X.translate(c.x,c.y);X.rotate(c.a);X.fillStyle=col;X.fillRect(-8,-4.5,16,9);
+  X.fillStyle='#0008';X.fillRect(2,-3.5,4,7);X.restore();
+}
+function draw(){
+  X.clearRect(0,0,C.width,C.height);
+  X.fillStyle='#2e3850';
+  for(let j=0;j<GH;j++)for(let i=0;i<GW;i++)if(grid[j][i])X.fillRect(i*S,j*S,S,S);
+  X.fillStyle='#4ade8066';X.fillRect((GW-2)*S,(GH-2)*S,S,S);
+  X.fillStyle='#fbbf2444';X.fillRect(S,S,S,S);
+  X.fillStyle='#fbbf24';
+  for(const g of signs){X.save();X.translate(g.x,g.y);X.rotate(g.a);X.beginPath();X.moveTo(11,0);X.lineTo(-2,-9);X.lineTo(-2,-4);X.lineTo(-11,-4);X.lineTo(-11,4);X.lineTo(-2,4);X.lineTo(-2,9);X.closePath();X.fill();X.restore();}
+  let lead=null;
+  for(const c of cars){if(!c.dead&&(!lead||c.mp<lead.mp))lead=c;}
+  for(const c of cars)drawCar(c,c.dead===1?'#ef444477':c.dead===2?'#fb923c77':c.dead===3?'#4ade80cc':'#60a5fa99');
+  if(lead){
+    X.lineWidth=1;
+    for(let i=0;i<9;i++){
+      const g=lead.rayAng(i),d=lead.rays[i]*R;
+      X.strokeStyle=lead.gr[i]?'#4ade80':lead.rev?'#f472b6':'#fde047';
+      X.beginPath();X.moveTo(lead.x,lead.y);X.lineTo(lead.x+Math.cos(g)*d,lead.y+Math.sin(g)*d);X.stroke();
+    }
+    drawCar(lead,'#ffffff');
+  }
+}
+function stats(){
+  const best=Math.max(...cars.map(c=>D0-c.mp));
+  $('st').innerHTML=`Generation <b>${gen}</b> · alive <b>${cars.filter(c=>!c.dead).length}/${N}</b> · best progress <b>${best.toFixed(1)}/${D0}</b> cells · last generation: <b>${lastWin}</b> finished, <b>${lastC}</b> crashed, <b>${lastS}</b> stalled · total finishes <b>${wins}</b>${testRes?` · best driver on unseen mazes: <b>${testRes}</b>`:''}`;
+}
+function loop(){
+  if(!paused){
+    const n=+$('sp').value;
+    for(let k=0;k<n;k++){for(const c of cars)c.step();if(cars.every(c=>c.dead))evolve();}
+  }
+  draw();stats();requestAnimationFrame(loop);
+}
+function reset(){gen=0;wins=0;lastWin=lastC=lastS=0;testRes='';bestFit=-1e9;bestG=null;cars=Array.from({length:N},()=>new Car(rgen()));}
+$('pp').onclick=()=>{paused=!paused;$('pp').textContent=paused?'Resume':'Pause';};
+$('nm').onclick=()=>{makeMaze();bestFit=-1e9;cars=cars.map(c=>new Car(c.g));};
+$('rs').onclick=reset;$('tb').onclick=()=>{testBest();makeMaze();cars=cars.map(c=>new Car(c.g));};
+makeMaze();reset();loop();
+</script></body></html>
